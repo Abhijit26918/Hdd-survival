@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Raw Backblaze data: large, and Backblaze's terms ask that the raw data not be redistributed.
+# Regenerate via notebook.ipynb Section 1 (download link + instructions in README).
+data/data_Q1_2026.zip
+data/data_Q1_2026/
+data/seagate_hdd_q1_2026.parquet

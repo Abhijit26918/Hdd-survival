@@ -1,0 +1,730 @@
+====================================================================
+SEAGATE INTERVIEW PREP — HARD DRIVE FAILURE PREDICTION
+Notes built while working through seagate_prep_project_brief.md
+====================================================================
+
+BIG PICTURE
+-----------
+Project = one Jupyter notebook using REAL Backblaze drive telemetry,
+built to demonstrate 4 things a Seagate Data Science interviewer will
+probe for:
+  1. Warranty/reliability prediction framed as SURVIVAL ANALYSIS
+     (not naive binary classification)
+  2. Sequence/time-series reasoning (LSTM vs tree model, honest comparison)
+  3. Feature engineering + evaluation under severe CLASS IMBALANCE
+  4. EXPLAINABILITY (SHAP) tying back to the statistical model
+
+The strategic point: most intern candidates will show up with generic
+"I trained an XGBoost and got 90% accuracy" answers. This project is
+built so you instead have real numbers (actual AFR, actual hazard
+ratios, actual PR-AUC) and can explain WHY each modeling choice was
+made, in the vocabulary the interviewer already uses (reliability
+engineering, not generic ML).
+
+--------------------------------------------------------------------
+DATASET — Backblaze Drive Stats
+--------------------------------------------------------------------
+- Real quarterly telemetry Backblaze publishes: one row per drive per
+  day. Columns: date, serial_number, model, capacity_bytes, failure
+  (0/1), + ~90 SMART attribute columns (raw + normalized).
+- License terms to state in the notebook: cite Backblaze as source,
+  accept responsibility for how the data is used, don't resell raw data.
+- Scoping strategy (why it matters): take ONE quarter, filter to
+  Seagate models only (relevance to interviewer + cuts data size),
+  keep all failed drives + a random sample of healthy ones (~5-10k) to
+  preserve the imbalance story while keeping the notebook fast.
+  -> Document the TRUE failure rate before subsampling, and how
+     subsampling preserved the imbalance ratio. This is itself a
+     mini "I understand sampling bias" demonstration.
+- SMART attributes Backblaze's own research flags as predictive:
+    SMART 5   = Reallocated Sectors Count
+    SMART 187 = Reported Uncorrectable Errors
+    SMART 188 = Command Timeout
+    SMART 197 = Current Pending Sector Count
+    SMART 198 = Uncorrectable Sector Count
+    smart_9_raw = Power-On Hours (i.e., age of the drive)
+
+--------------------------------------------------------------------
+SECTION 1 — EDA (with real statistical reasoning)
+--------------------------------------------------------------------
+
+1) Annualized Failure Rate (AFR)
+   - Industry-standard way to report failure rate (Backblaze itself
+     uses this), instead of raw "% of drive-days that failed."
+   - Rough formula: AFR = (failures / drive-days observed) * 365
+   - Why it matters: speaking in AFR instead of raw accuracy numbers
+     signals you know the domain's own vocabulary.
+
+2) Missing SMART data is NOT random
+   - Some SMART attributes are legitimately null because they don't
+     exist for certain drive models/firmware — not a data quality bug.
+   - Explain this BEFORE imputing. Blind imputation (e.g., fillna(0))
+     without this explanation looks careless to a hardware company.
+
+3) Class imbalance, quantified explicitly
+   - State it plainly: "X% of drive-days are failures. A naive
+     always-predict-healthy model would be Y% accurate and useless."
+   - This is the setup/justification for using PR-AUC / recall / F2
+     instead of accuracy later in Section 4.
+
+4) Correlation of top SMART attributes with failure
+   - Verify independently that SMART 5, 187, 188, 197, 198 correlate
+     with failure on your own data slice (Backblaze's blog already
+     found this — replicating it yourself is a credibility check,
+     not just citing them).
+
+5) The "bathtub curve" (classic reliability engineering concept)
+   - Plot failure rate vs. power-on hours (age).
+   - Shape: HIGH early (infant mortality / manufacturing defects) ->
+     LOW & FLAT in the middle (useful life) -> RISING late (wear-out).
+   - Recovering this shape from real data is a strong, well-known
+     signal you understand hardware reliability, not just generic ML.
+   - Sets up Section 2's survival-analysis framing.
+
+--------------------------------------------------------------------
+REAL RESULTS — Section 1, run on actual Backblaze Q1 2026 data
+(Seagate HDDs only, model starts with "ST" -- verified this cleanly
+excludes SSDs too: every non-"ST" Seagate-branded model name in this
+dataset turned out to be a BarraCuda/FireCuda/IronWolf SSD kit)
+--------------------------------------------------------------------
+
+Full population (before any subsampling):
+  Drive-days observed:          10,068,229
+  Unique Seagate HDDs (Q1):     114,976
+  Distinct drives that failed:  406
+  TRUE Annualized Failure Rate: 1.47%
+
+1) SUBSAMPLING -- an important correction to how I first described it
+   - Plan: keep ALL day-rows for the 406 failed drives (full trajectory
+     matters for survival/LSTM later) + a random sample of 8,000 of the
+     ~114,570 never-failed drives (also full trajectories).
+   - WRONG initial claim: "this preserves the true imbalance." It does
+     NOT, and it shouldn't -- the working-set AFR came out as 20.64%,
+     ~14x the true population AFR (1.47%).
+   - WHY: keeping 100% of the rare failed drives while cutting the
+     healthy population ~14x mechanically concentrates the failure
+     signal. This is exactly "undersampling the majority class" --
+     the same imbalance-handling technique Section 4 uses for the
+     classifier (class weights / SMOTE are the alternatives).
+   - Lesson to say out loud in the interview: never confuse a
+     deliberately-undersampled working AFR with the real-world AFR.
+     If a model's output probability is ever presented as a calibrated
+     real-world risk (not just a ranking score), it must be
+     recalibrated back against the true 1.47% base rate.
+
+2) MISSING DATA -- came out smaller than expected
+   - All 6 key SMART columns (5, 9, 187, 188, 197, 198) were missing
+     on only ~0.06-0.08% of drive-days in the Seagate-only slice.
+   - Honest note: the brief assumed missingness would be a bigger,
+     more clearly "model-dependent" story. On this real slice it's
+     small -- still worth stating explicitly rather than silently
+     imputing, but it's not a dramatic finding here. Good example of
+     "let the data tell you what's actually true," not what you
+     expected to find.
+
+3) CLASS IMBALANCE, quantified on the working (undersampled) set
+   - 406 failure drive-days out of 717,628+406 = 718,034 total
+     (0.057% of drive-days).
+   - Naive always-predict-healthy baseline accuracy: 99.94%.
+   - This is the number that justifies PR-AUC/recall/F2 over accuracy
+     later in Section 4.
+
+4) SMART ATTRIBUTE CORRELATION WITH FAILURE (real result)
+   - Method: took each drive's LAST OBSERVED reading in the quarter
+     (one row per drive, not one row per drive-day) to correlate
+     against eventual failure -- avoids pseudo-replication bias from
+     drives that were simply observed for more days.
+   - Result (correlation with eventual failure), matches Backblaze's
+     own published finding -- independently verified on our slice:
+       smart_5_raw   (Reallocated Sectors)     0.359  <- strongest
+       smart_198_raw (Uncorrectable Sectors)   0.196
+       smart_197_raw (Current Pending Sector)  0.196
+       smart_188_raw (Command Timeout)         0.188
+       smart_187_raw (Reported Uncorrect. Err) 0.161
+       smart_9_raw   (Power-On Hours / age)    0.011  <- near zero
+   - Interesting real finding: raw age alone barely correlates
+     linearly with failure -- because the relationship is NOT linear,
+     it's the bathtub-curve shape (see #5). This is a good talking
+     point: "linear correlation misses non-monotonic relationships,
+     which is exactly why we look at age with binning/survival
+     methods instead of just correlating it directly."
+
+5) BATHTUB CURVE -- genuinely recovered from real data
+   - Binned drives by last-known power-on hours (age), plotted
+     fraction that ultimately failed per bin:
+       0-1yr: 6.41%   1-2yr: 5.28%   2-3yr: 1.02%
+       3-4yr: 0.87%   4-5yr: 2.76%   5yr+: 6.28%
+   - Real U-shape: high early (infant mortality), low mid-life
+     (useful life), rising again at 5yr+ (wear-out). This is a strong,
+     genuine reliability-engineering signal recovered from actual data,
+     not a synthetic/forced example.
+   - Explicit caveat stated in the notebook: this naive binned view
+     does NOT account for censoring (a drive at low age just hasn't
+     had time to fail yet -- that's not the same as "reliable at that
+     age"). This is exactly the gap Kaplan-Meier (Section 2) fixes.
+
+--------------------------------------------------------------------
+PROJECT SETUP NOTES (for reference)
+--------------------------------------------------------------------
+- Project venv at D:\Harddrive failure\.venv, registered as Jupyter
+  kernel "seagate-venv" (installed: jupyter, pandas, numpy,
+  matplotlib, seaborn, scikit-learn, lifelines, xgboost, shap,
+  streamlit; PyTorch still to be added for the Section 5 LSTM).
+- Real data: Backblaze Q1 2026 quarterly ZIP, extracted to
+  data/data_Q1_2026/data_Q1_2026/*.csv (90 daily files).
+- notebook.ipynb caches the filtered Seagate-HDD slice to
+  data/seagate_hdd_q1_2026.parquet so re-runs don't need to re-read
+  all 90 CSVs.
+- Plots saved to plots/*.png as well as embedded in the notebook.
+- To re-run notebook from terminal:
+    .venv\Scripts\python.exe -m jupyter nbconvert --to notebook \
+      --execute --inplace --ExecutePreprocessor.kernel_name=seagate-venv \
+      notebook.ipynb
+  Or open notebook.ipynb in VS Code / Jupyter and select the
+  "Python (seagate-venv)" kernel.
+
+--------------------------------------------------------------------
+SECTION 2 — SURVIVAL ANALYSIS (with the actual math)
+--------------------------------------------------------------------
+
+WHY: a binary failure label throws away "when." A drive that failed on
+day 90 of 90 is very different from one that failed on day 2, but
+0/1 classification treats them the same. Survival analysis models
+TIME TO EVENT and handles CENSORING correctly, which classification
+cannot do natively.
+
+1) CENSORING -- the core concept
+   - For drive i: true failure time T_i (maybe never observed), and
+     C_i = when our observation window ends (quarter end, or drive
+     leaves the fleet for an unknown reason).
+   - We only ever observe:
+         Y_i = min(T_i, C_i)                (the time we recorded)
+         delta_i = 1 if T_i <= C_i else 0    (1 = failure, 0 = censored)
+   - delta_i = 0 ("right-censored") means: "survived AT LEAST until
+     Y_i, unknown after that" -- NOT "confirmed healthy forever."
+   - THE MISTAKE TO AVOID: treating still-running drives as permanent
+     negatives. Doing so biases results toward overestimating
+     reliability (young drives look artificially safe just because we
+     haven't watched them long enough to see them fail).
+
+2) KAPLAN-MEIER ESTIMATOR (product-limit estimator)
+   - Survival function: S(t) = P(T > t) -- probability of surviving
+     past t (t = power-on hours here).
+   - Formula:
+         S_hat(t) = PRODUCT over all failure times t_j <= t of (1 - d_j/n_j)
+     where at each distinct observed failure time t_j:
+         n_j = number of drives still AT RISK just before t_j
+               (not yet failed or censored)
+         d_j = number of drives that failed exactly at t_j
+   - Intuition: survival to time t = product of "made it through this
+     instant" conditional probabilities, chained across every failure
+     time up to t. Censored drives contribute to n_j while they're
+     under observation, then just drop out of the risk set -- never
+     miscounted as a failure OR as a guaranteed survivor.
+
+3) HAZARD FUNCTION h(t) -- more actionable than S(t) alone
+   - Definition: h(t) = lim_{dt->0} P(t <= T < t+dt | T >= t) / dt
+   - It's a RATE (can exceed 1), not a probability -- like a
+     speedometer of instantaneous failure risk, vs S(t) being more
+     like an odometer of cumulative survival.
+   - Link between the two, via cumulative hazard H(t) = integral of
+     h(u) du from 0 to t:
+         S(t) = exp(-H(t))       <=>       h(t) = -d/dt [ln S(t)]
+   - WHY IT MATTERS OPERATIONALLY: a fleet manager doesn't act on
+     "35% of this cohort eventually fails" -- they act on "THIS
+     drive's instantaneous risk just crossed a threshold, replace it
+     now." h(t) (and Cox PH in Section 3, which models h(t) as a
+     function of SMART covariates) is what a real monitoring system
+     would actually consume.
+
+4) LOG-RANK TEST -- is a visible gap between two curves real?
+   - Null hypothesis H0: S_A(t) = S_B(t) for all t (same underlying
+     survival curve for both groups).
+   - At each distinct failure time across the pooled groups, compares
+     OBSERVED failures per group to EXPECTED failures under H0 (using
+     the pooled risk set), aggregates into a chi-square statistic
+     (1 degree of freedom for a 2-group test):
+         chi^2 = [sum_j(O_Aj - E_Aj)]^2 / sum_j Var(O_Aj)
+   - Small p-value (<0.05 conventionally) => unlikely the two groups
+     actually share the same reliability profile.
+
+--------------------------------------------------------------------
+REAL RESULTS — Section 2, run on actual data
+--------------------------------------------------------------------
+- Per-drive survival dataset: 114,973 Seagate HDDs with usable
+  duration (power-on hours at last observation).
+    Events (failures) observed: 403
+    Censored (still running):   114,570
+  (Uses the FULL population, not the undersampled Section-1 working
+  set -- KM/log-rank need the true risk-set sizes to be correct, and
+  114,973 per-drive rows is cheap to fit directly, no need to
+  subsample for survival analysis.)
+- Overall KM curve: survival probability stays >=0.999 out to ~40,000
+  power-on hours, then drops in visible steps to ~0.981 by ~78,000
+  hours, with a widening confidence band at high hours (fewer drives
+  have been observed that long -> more uncertainty). Median survival
+  time = infinite/undefined, as expected: well under 50% of drives
+  fail within the observed window (~1.5% AFR), so S(t) never reaches
+  0.5.
+- Two-model comparison: ST16000NM001G (n=34,729, 44 failures, ~0.13%
+  raw failure rate) vs ST12000NM0008 (n=18,650, 129 failures, ~0.69%
+  raw failure rate). KM curves visibly diverge after ~45,000 hours --
+  ST12000NM0008 drops much faster.
+- Log-rank test: chi^2 = 46.85, p = 7.67e-12 -> statistically
+  significant difference between the two models' survival curves,
+  confirming what the plot shows is real, not noise.
+
+--------------------------------------------------------------------
+SECTION 3 — COX PROPORTIONAL HAZARDS (with the actual math)
+--------------------------------------------------------------------
+
+1) THE MODEL
+   - h(t | X_i) = h_0(t) * exp(beta^T X_i)
+       h_0(t)   = baseline hazard, an UNSPECIFIED function of time
+                  shared by all drives (semi-parametric -- this is
+                  Cox's key trick: beta can be estimated from the
+                  ORDERING of failure times alone via "partial
+                  likelihood," without ever specifying h_0(t)).
+       exp(beta^T X_i) = drive-specific multiplicative adjustment.
+   - "Proportional hazards" = the RATIO of two drives' hazards is
+     constant over time (doesn't depend on t):
+         h(t|X1)/h(t|X2) = exp(beta^T (X1 - X2))
+   - Hazard ratio: HR_j = exp(beta_j) for covariate j (holding others
+     fixed). HR=1 no effect, HR>1 increases risk, HR<1 protective.
+   - THE HEADLINE SENTENCE TO SAY IN THE INTERVIEW: "a hazard ratio of
+     2.1 for SMART X means those drives fail at ~2.1x the
+     instantaneous rate, controlling for the other covariates."
+
+2) FEATURE CHOICES (all defensible modeling decisions, not defaults)
+   a) BINARY FLAGS not raw counts for SMART 5/187/188/197. These are
+      heavily right-skewed count attributes (mostly 0, long tail).
+      Cox PH assumes LINEARITY in log-hazard space -- a raw skewed
+      count badly violates that (0->1 reallocated sector is a much
+      bigger signal than 50->51). "Has this drive EVER logged this
+      error" (presence flag) is both more physically meaningful and
+      much better-behaved for the model.
+   b) DROPPED SMART 198 -- confirmed via direct check that
+      smart_197_raw == smart_198_raw on 99.998% of drive-days (a real
+      Backblaze firmware quirk: many drives report Current Pending
+      Sector and Offline Uncorrectable Sector identically). Including
+      both would be near-perfect collinearity. Kept SMART 197, dropped
+      198. (This callback to the earlier EDA correlation step, where
+      smart_197 and smart_198 had IDENTICAL correlation values to 6
+      decimals -- that repetition was the tell.)
+   c) AGE IS NOT A COVARIATE -- power-on hours (smart_9_raw) is
+      already the model's TIME AXIS ("duration"). An age covariate
+      would just be duration/1000, i.e. a deterministic linear
+      function of t itself -- perfectly collinear with the timeline,
+      which breaks the optimizer. The baseline hazard h_0(t) already
+      captures age-dependent risk (the bathtub curve) nonparametrically
+      -- that's the whole point of not having to specify h_0(t).
+      KEY INSIGHT: distinguish "age as the timeline" vs "age as a
+      covariate" -- can't be both in the same model.
+
+3) A REAL CONVERGENCE BUG, DIAGNOSED AND FIXED
+   - First fit attempt (no regularization, penalizer=0) FAILED:
+     "Convergence halted due to matrix inversion problems. Suspicion
+     is high collinearity." But pairwise correlations between the 4
+     SMART flags were only moderate (max ~0.51) -- not truly collinear.
+   - Real cause: QUASI-COMPLETE SEPARATION. Each flag is only ~2-9%
+     prevalent, and with just 403 total failures, some covariate
+     patterns have very few/zero non-events -- this drives a
+     coefficient toward +/-infinity and blows up the Hessian. Classic
+     issue with rare binary predictors + rare events in Cox PH.
+   - Fix: small L2 penalty via `penalizer=` (ridge-style shrinkage).
+     Swept it:
+       penalizer=0.01 -> "converges" but explodes to nonsense
+                          (HR ~5254 for SMART 197 -- separation
+                          artifact barely tamed, not a real effect)
+       penalizer=0.1  -> converges cleanly, plausible HRs
+       penalizer=1.0  -> over-shrinks everything toward HR~1,
+                          washing out genuine signal
+     Used penalizer=0.1 as the sweet spot.
+   - LESSON: "my model failed to converge, I diagnosed why (separation
+     from rare binary predictors + rare events, not raw collinearity),
+     and fixed it with a standard, explainable regularization choice"
+     is a much stronger interview story than either hiding the error
+     or not understanding why penalizer helps.
+
+--------------------------------------------------------------------
+REAL RESULTS — Section 3, run on actual data
+--------------------------------------------------------------------
+- Dataset: 114,897 drives, 403 events (failures), Cox PH with
+  penalizer=0.1.
+- Hazard ratios (all p < 0.005):
+      SMART 5   (Reallocated Sectors)      HR = 1.21
+      SMART 187 (Reported Uncorrect. Err)  HR = 1.50
+      SMART 188 (Command Timeout)          HR = 1.25
+      SMART 197 (Current Pending Sector)   HR = 2.14  <- strongest
+  Concordance = 0.79 (good discrimination for a survival model).
+- Proportional-hazards assumption check: "looks okay" (lifelines'
+  Schoenfeld-residual-based test) -- checked and passed, stated
+  explicitly rather than assumed.
+- GENUINELY INTERESTING FINDING: SMART 5 had the HIGHEST marginal
+  correlation with failure in Section 1 (0.359), but SMART 197 has
+  the HIGHEST hazard ratio here (2.14x) once you control for the
+  other SMART flags. Marginal correlation and multivariate-adjusted
+  effect size can disagree when predictors co-occur (SMART 5 and 187
+  were correlated with each other at 0.47) -- a good example of why
+  "look at correlation" and "control for confounds" are different
+  questions with potentially different answers.
+
+--------------------------------------------------------------------
+SECTION 4 — PRACTICAL CLASSIFIER (with the actual math)
+--------------------------------------------------------------------
+
+WHY: Cox PH (Section 3) answers a population-level question ("how
+does each SMART attribute affect risk, on average"). A dashboard
+needs a per-drive, per-day risk SCORE instead -- a different,
+complementary question.
+
+1) TARGET DEFINITION: "will this drive fail within the next 7 days?"
+   - NOT "does it fail today" -- that's only 1 positive day per failed
+     drive (no lead time, useless for action).
+   - Computed via reversed rolling-max over `failure` per drive: for
+     each day t, label=1 if failure occurs at any of t..t+6.
+   - Standard predictive-maintenance framing: a risk score needs lead
+     time to be actionable.
+
+2) FEATURE ENGINEERING
+   - Current SMART 5/187/188/197 raw values + age (smart_9_raw) +
+     model (categorical, native XGBoost categorical support).
+   - Added smart_5_delta_7d = diff(7) (today's value minus 7 days ago)
+     -- an "actively climbing" reallocated-sector count is a stronger
+     signal than the same flat absolute count. Computed from PAST data
+     only (diff(7) looks backward) -- never leaks the future, unlike
+     the label itself.
+
+3) GROUP-AWARE TRAIN/TEST SPLIT
+   - Split by DRIVE (serial_number), not by row -- rows from the same
+     drive are highly correlated day to day, so a row-level random
+     split would leak near-future drive state into train.
+   - Split failed and healthy populations SEPARATELY (80/20 each) so
+     both train and test keep a realistic share of the (already rare)
+     failure events, rather than risking a test set with zero
+     failures by chance.
+
+4) CLASS IMBALANCE: class weights vs SMOTE (chose class weights)
+   - Class weight formula (XGBoost `scale_pos_weight`):
+         w = N_negative / N_positive     (computed on TRAIN ONLY,
+                                           never on test -- that would
+                                           leak test class balance)
+   - SMOTE formula (for comparison/understanding, not used):
+         x_new = x_i + lambda * (x_zi - x_i),  lambda ~ Uniform(0,1)
+     (interpolate between a minority sample x_i and one of its
+     k-nearest minority neighbors x_zi)
+   - WHY class weights over SMOTE here: (a) SMOTE would interpolate
+     between DIFFERENT DRIVES' SMART-attribute vectors, risking
+     physically implausible synthetic combinations (blending one
+     drive's sector trajectory with another's age); (b) SMOTE must be
+     fit only on the training fold after the group split to avoid
+     leakage -- easy to get subtly wrong. Class weighting gets the
+     same "care more about rare positives" effect with no synthetic
+     data and no extra leakage surface.
+
+5) EVALUATION METRICS -- why PR-AUC and F2, not accuracy or ROC-AUC
+   - NOT accuracy: Section 1 showed naive always-healthy = ~99.9%+
+     accuracy while useless. Must always compare against that
+     baseline, not raw accuracy.
+   - PR-AUC over ROC-AUC: ROC-AUC's x-axis is FPR = FP/(FP+TN). Under
+     severe imbalance TN is huge, so FPR stays tiny even with lots of
+     false alarms relative to true positives -- ROC-AUC can look
+     deceptively good for a weak model. Precision = TP/(TP+FP) is
+     directly sensitive to false-alarm rate relative to true catches
+     -- the number that actually matters operationally.
+   - F-beta formula:
+         F_beta = (1+beta^2) * (P*R) / (beta^2*P + R)
+     F1 (beta=1) weighs precision/recall equally. F2 (beta=2) weighs
+     RECALL 4x more than precision (beta^2=4) -- matches the real cost
+     asymmetry: missing a failure (drive dies with no warning) is
+     worse than a false alarm (unneeded inspection).
+
+6) CALIBRATION -- two SEPARATE issues found, not one
+   - Issue A (found by actually plotting it, not assumed): even on
+     the WORKING SET's own scale, predicted probabilities are NOT
+     calibrated -- the curve sits well below the diagonal at every
+     bin (highest bin: ~0.65 predicted risk vs only ~3% observed).
+     This is a real, known side effect of scale_pos_weight: it
+     reweights the LOSS to force attention onto rare positives, which
+     helps ranking/recall, but distorts output probabilities away from
+     empirical frequency as a side effect. The curve IS monotonic
+     though, so it's still valid for RANKING drives by relative risk
+     -- just not valid as a literal probability.
+   - Issue B (expected from Section 1): even a properly-calibrated
+     version would only be calibrated to the working set's inflated
+     AFR (~14x true), not the real fleet rate.
+   - BOTTOM LINE for a dashboard: safe for ranking/triage ("replace
+     top-N riskiest drives first"), NOT safe to present as "X% chance
+     of failing this week" without (a) a calibration step on top
+     (e.g. CalibratedClassifierCV + isotonic regression) and (b) a
+     prior-correction back to the true population base rate.
+
+--------------------------------------------------------------------
+REAL RESULTS — Section 4, run on actual data
+--------------------------------------------------------------------
+- Label: 2,655 positive ("fails within 7 days") drive-days out of
+  718,034 in the working set (0.370%).
+- Train/test (group split by drive): train = 574,812 drive-days /
+  2,138 positive / 6,724 drives. Test = 143,222 drive-days / 517
+  positive / 1,682 drives.
+- scale_pos_weight = 572,674 / 2,138 = 267.9
+- PR-AUC: model = 0.1282 vs random baseline = 0.0036 (baseline equals
+  test-set positive rate) -> ~35x lift over chance. Read PR-AUC
+  RELATIVE to this baseline, not as an absolute number -- 0.128 sounds
+  unimpressive alone but is a large improvement given how rare the
+  event is.
+- Best-F2 operating point: threshold=0.9615, precision=22.6%,
+  recall=40.6%, F2=0.350. I.e. at this threshold the model catches
+  ~41% of drives that will fail within a week, at a cost of roughly
+  1 correct flag per ~4.4 total flags raised.
+- Calibration curve confirmed Issue A above empirically (monotonic
+  but far below the diagonal) -- this was a genuine finding from
+  actually running the diagnostic, not something assumed in advance.
+
+--------------------------------------------------------------------
+SECTION 5 — LSTM vs TREE MODEL (with the actual math)
+--------------------------------------------------------------------
+
+THE QUESTION: does modeling the RAW SEQUENCE of a SMART attribute
+over time capture more signal than a handful of hand-engineered
+summary stats of that same sequence? To isolate this cleanly, BOTH
+models see ONLY information derived from SMART 5 (Reallocated
+Sectors) -- narrower than Section 4's full multi-feature classifier,
+on purpose. Task is DRIVE-LEVEL (one example per drive: did it ever
+fail), not drive-day-level like Section 4.
+
+1) LSTM GATE EQUATIONS
+   - Vanilla RNN: h_t = tanh(W[h_{t-1}, x_t]) -- repeatedly passed
+     through a weight matrix + squashing nonlinearity every step;
+     over ~30 steps, backprop gradients tend to vanish/explode.
+   - LSTM fixes this with an explicit, mostly-ADDITIVE cell state c_t,
+     controlled by 3 sigmoid gates (each in [0,1], soft on/off switch):
+         f_t = sigmoid(W_f[h_{t-1},x_t] + b_f)   forget gate
+         i_t = sigmoid(W_i[h_{t-1},x_t] + b_i)   input gate
+         c~_t = tanh(W_c[h_{t-1},x_t] + b_c)     candidate cell content
+         c_t = f_t * c_{t-1} + i_t * c~_t        cell update (ADDITIVE)
+         o_t = sigmoid(W_o[h_{t-1},x_t] + b_o)   output gate
+         h_t = o_t * tanh(c_t)                   hidden state
+   - KEY POINT: c_t's update is additive in c_{t-1} (just scaled by
+     f_t), not repeatedly matrix-multiplied -- gives gradients a more
+     direct path back through many time steps than vanilla RNN. That's
+     the entire motivation for LSTM over plain RNN on longer sequences.
+   - Classification head: take final hidden state h_T as a learned
+     summary of the whole sequence, one linear layer -> logit.
+
+2) DESIGN CHOICES
+   - Sequence: last 30 daily smart_5_raw readings per drive, left-zero-
+     padded if the drive has fewer than 30 observed days.
+   - Preprocessing: log1p(x) then standardize using TRAIN-set mean/std
+     only (SMART 5 is heavily right-skewed; scaling stats must come
+     from train only to avoid leakage into test).
+   - Imbalance handling: BCEWithLogitsLoss(pos_weight=N_neg/N_pos) --
+     the direct PyTorch analogue of Section 4's XGBoost
+     scale_pos_weight; same underlying idea (reweight the loss, don't
+     touch the data).
+   - Tree-model comparison uses summary stats of the SAME SMART 5
+     sequence: last value, max, mean, std, overall trend, 7-day delta
+     -- same drives, same train/test split, same target -- so the
+     comparison isolates "sequence vs summary-stats of one attribute,"
+     not "more features vs fewer."
+
+3) HONEST CONCLUSION (written from the actual numbers, not assumed)
+   - With a small dataset (thousands of drives, only ~300-400
+     failures) and a short, noisy single-attribute sequence, an LSTM
+     has very little data to learn temporal patterns beyond what
+     "last value, max, trend" already capture.
+   - If the tree model matches or beats the LSTM, THAT ITSELF IS A
+     GENUINELY DEFENSIBLE FINDING, not an LSTM failure -- it means the
+     temporal pattern in a 30-day single-attribute window isn't adding
+     much beyond its summary statistics, given this much data. LSTMs
+     earn their keep with much longer sequences, more training
+     examples, and multivariate inputs.
+   - GOOD INTERVIEW CALLBACK (per the brief): if this matches an
+     earlier RNN/LSTM-vs-simpler-model comparison on a different
+     sequence domain (e.g. ECG waveforms), say so explicitly -- same
+     underlying question: "how much sequence memory does the model
+     actually need to capture the degradation pattern."
+
+--------------------------------------------------------------------
+REAL RESULTS — Section 5, run on actual data
+--------------------------------------------------------------------
+- Train: 6,724 drive sequences, 324 positive (failed). Test: 1,682
+  drive sequences, 82 positive.
+- LSTM pos_weight = 19.8. Training loss decreased 1.018 -> 0.946 over
+  40 full-batch epochs (slow but steadily decreasing).
+- LSTM PR-AUC = 0.4634  vs random baseline = 0.0488 (~9.5x lift).
+- Tree model PR-AUC = 0.4790 (summary stats of the same SMART 5
+  sequence).
+- RESULT: tree model slightly ahead of the LSTM (0.479 vs 0.463), PR
+  curves nearly overlapping across most of the recall range, converging
+  at high recall. This IS the expected, defensible finding -- confirms
+  the honest-conclusion narrative above actually happened here, not
+  just as a hedge in the write-up.
+
+--------------------------------------------------------------------
+SECTION 6 — SHAP EXPLAINABILITY (with the actual math)
+--------------------------------------------------------------------
+
+WHY: explain Section 4's XGBoost classifier's individual predictions,
+and cross-check its top features against Section 3's Cox PH hazard
+ratios. If two INDEPENDENTLY-FIT models (nonparametric tree ensemble
+vs semi-parametric survival model, different targets, different
+feature encodings, different populations) agree on what matters,
+that's a much stronger statement than either result alone.
+
+1) SHAPLEY VALUE FORMULA
+   phi_i = SUM over subsets S of F\{i} of
+             [|S|! * (|F|-|S|-1)!] / |F|!  *  [f(S union {i}) - f(S)]
+   - "Fair" attribution of a prediction back to each feature, treating
+     features as cooperating "players." phi_i = feature i's average
+     marginal contribution across every possible order features could
+     be "added in."
+   - Only attribution method satisfying: efficiency, symmetry, dummy,
+     additivity simultaneously. EFFICIENCY in particular:
+         f(x) = phi_0 + sum_i phi_i
+     (SHAP values for one prediction sum exactly to prediction minus
+     baseline -- nothing left unexplained).
+   - Exact computation is exponential in general (2^|F| subsets), BUT
+     for TREE ENSEMBLES specifically, TreeSHAP computes EXACT Shapley
+     values in polynomial time by exploiting tree structure -- why
+     SHAP is practical for gradient-boosted models like ours.
+
+2) GLOBAL vs LOCAL EXPLANATION
+   - Global: mean |SHAP value| per feature across many rows = overall
+     importance (bar chart).
+   - Beeswarm: per-row SHAP value (x-axis) + feature's raw value
+     (color) -- shows DIRECTION not just magnitude (e.g. does high
+     SMART 187 push risk up or down, and by how much, for every row).
+   - Local/waterfall: one single prediction's full breakdown --
+     "here's exactly why the model flagged THIS drive."
+
+3) REAL BUG HIT: shap.plots.beeswarm(shap_values, ax=ax) raised
+   ValueError -- beeswarm doesn't support passing both `ax=` and its
+   default `plot_size` together (a real SHAP API quirk, not a modeling
+   issue). Fix: don't pass ax=; let it manage its own figure, then
+   grab plt.gcf() to resize/save. (shap.plots.bar DOES support ax= --
+   only beeswarm has this restriction.)
+
+--------------------------------------------------------------------
+REAL RESULTS — Section 6, run on actual data
+--------------------------------------------------------------------
+- Global SHAP importance ranking (top to bottom): model (+1.23),
+  smart_187_raw (+1.05), smart_9_raw/age (+0.75), smart_197_raw
+  (+0.20), smart_5_delta_7d (+0.15), smart_188_raw (+0.13),
+  smart_5_raw (+0.13).
+- CROSS-CHECK vs Cox PH (4 shared SMART attributes only -- model and
+  age excluded from Cox for principled reasons already noted in
+  Section 3, so the comparison is restricted to attributes both
+  models can actually be judged on):
+        Feature          SHAP rank   Cox PH rank
+        smart_187_raw    1           2
+        smart_197_raw    2           1
+        smart_188_raw    3           3   <- exact agreement
+        smart_5_raw      4           4   <- exact agreement
+  RESULT: exact agreement on ranks 3-4, ranks 1-2 swapped between the
+  two methods. This is a genuinely honest "mostly agree" finding --
+  not a perfect match (which would look suspicious/overclaimed), not
+  a mismatch either. Say this precisely in the interview, don't round
+  it up to "they agree perfectly."
+- Concrete local example: found a true positive at predicted risk =
+  0.997 (f(x)=5.886 in log-odds, sigmoid(5.886)=0.997, confirming the
+  waterfall breakdown is internally consistent). Top drivers for that
+  specific drive-day: smart_188_raw=85,900,853,275 (an enormous raw
+  command-timeout counter -- likely a firmware overflow/quirk, not a
+  literal count) contributing +1.69, smart_197_raw=18,182 (+1.67),
+  model=ST24000NM002H (+1.28), smart_187_raw=2 (+0.73), age=7,934 hrs
+  (+0.59).
+- BONUS independent finding: the beeswarm's smart_9_raw (age) row
+  shows a scattered, NON-MONOTONIC color pattern (both high and low
+  age values appear on both sides of SHAP=0), unlike the SMART error
+  attributes which cleanly separate red/positive. This is SHAP
+  independently recovering the same message as Section 1's bathtub
+  curve: age's effect on risk isn't linear/monotonic, so it can't
+  show up as a clean "high age = high risk" color gradient the way
+  error counts do.
+- `model` and age (smart_9_raw) dominate global SHAP importance,
+  ranking ABOVE all 4 SMART attributes -- but this is a STRUCTURAL
+  difference from Cox PH, not a substantive one: `model` was never a
+  Cox covariate, and age couldn't be (it's Cox's time axis, Section 3
+  point 2c). Worth stating explicitly so this doesn't look like an
+  unexplained discrepancy between the two models.
+
+--------------------------------------------------------------------
+SECTION 7 — DASHBOARD (dashboard.py, separate file)
+--------------------------------------------------------------------
+
+DESIGN: real train/serve separation, not a toy detail -- the notebook
+trains everything (Sections 1-6), then a setup cell SAVES the trained
+artifacts to disk; dashboard.py is a lean, separate Streamlit script
+that only LOADS and DISPLAYS them, never retrains anything. This is
+a legitimate small-scale engineering practice point worth mentioning
+in the interview (separating training pipeline from serving).
+
+ARTIFACTS SAVED BY THE NOTEBOOK (models/, data/):
+  models/xgb_classifier.json   -- the Section 4 XGBoost classifier
+  models/feature_meta.json     -- feature_cols list + exact category
+                                   set the classifier was trained on
+                                   (needed to reproduce identical
+                                   categorical encoding for `model`)
+  data/current_snapshot.parquet    -- latest known day per drive
+                                       (working-set drives only)
+  data/survival_df_export.parquet  -- full-population per-drive
+                                       duration/event/model (Section 2)
+  data/fleet_daily_summary.parquet -- date, drive_count, failure_count
+                                       (full population, 90 days)
+
+SCOPING DECISION (stated explicitly, not hidden): the risk table
+scores the same WORKING-SET drives used to train/evaluate the
+classifier in Section 4 (406 failed + 8,000 healthy), NOT the full
+~115K-drive fleet. Reason: keeps the categorical `model` encoding
+trivially consistent with what the classifier actually saw in
+training (no unseen-category handling needed) -- consistent with
+every other scoping decision made throughout this project.
+
+DASHBOARD CONTENTS (3 sections, matching the brief):
+  1. Fleet-level daily failure rate over time (static matplotlib line
+     chart, full population, 90 days) -- kept static/simple on purpose.
+  2. Kaplan-Meier survival curve by model -- user picks models via a
+     multiselect, KM curves fit LIVE in the dashboard (fast enough on
+     ~115K per-drive rows, no need to pre-cache every possible model
+     pairing).
+  3. Top-N highest-risk drives table -- current predicted 7-day risk
+     per drive (slider controls N), PLUS the single top SHAP-driving
+     feature name for each of those top drives (SHAP computed live,
+     cheap since N is small, e.g. 15-50 rows).
+  Each section includes an inline caption repeating the relevant
+  honesty caveat from earlier sections (e.g. "risk scores are
+  calibrated to the working set, not the true fleet -- use for
+  ranking/triage, not literal probability").
+
+TESTING NOTE: a plain `curl localhost:PORT` only confirms the
+Streamlit SERVER started -- it does NOT execute the app script (that
+only happens once a browser opens a websocket session). To actually
+verify the dashboard runs without exceptions, used Streamlit's
+`streamlit.testing.v1.AppTest` headless test harness
+(`AppTest.from_file("dashboard.py").run()`), which really executes
+the full script and surfaces exceptions -- confirmed 0 exceptions,
+all 3 sections render, and the top-risk table returns real, sensible
+values (~0.997-0.999 predicted risk, driven by smart_187/197/9/188 --
+consistent with Sections 3 and 6's findings).
+
+TO RUN: `.venv\Scripts\python.exe -m streamlit run dashboard.py`
+(needs the notebook to have been run at least once first, so the
+models/ and data/*.parquet artifacts exist).
+
+--------------------------------------------------------------------
+PROJECT COMPLETE -- all 7 sections built, executed on real data, and
+verified. Final file layout:
+  seagate_prep_project_brief.md   -- original brief
+  notes.txt                        -- this file (concepts + math +
+                                       real results + bugs, as built)
+  notebook.ipynb                   -- full analysis, Sections 0-7
+  dashboard.py                     -- Streamlit app (Section 7)
+  data/                            -- raw CSVs, cached parquet,
+                                       exported dashboard data
+  models/                          -- exported classifier + metadata
+  plots/                           -- 14 PNG charts, also embedded in
+                                       the notebook
+  .venv/                           -- project virtualenv, registered
+                                       as Jupyter kernel "seagate-venv"
+--------------------------------------------------------------------
