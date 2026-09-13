@@ -1,5 +1,5 @@
 ====================================================================
-SEAGATE INTERVIEW PREP — HARD DRIVE FAILURE PREDICTION
+SEAGATE — HARD DRIVE FAILURE PREDICTION
 Notes built while working through seagate_prep_project_brief.md
 ====================================================================
 
